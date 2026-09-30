@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    image: gray-release-api:latest
+    container_name: gray-release-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 可选：制品签名密钥（JSON 映射 key_id -> secret）。
+      # 用法：SIGNING_KEYS='{"key-a":"secret"}' docker compose up --build
+      - SIGNING_KEYS=${SIGNING_KEYS:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped

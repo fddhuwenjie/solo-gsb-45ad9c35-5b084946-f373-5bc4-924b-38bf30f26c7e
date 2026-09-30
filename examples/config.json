@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "switches": [
+    {
+      "id": "new_checkout",
+      "enabled": true,
+      "salt": "checkout-rollout-2026",
+      "default_variant": "off",
+      "variants": [
+        {"id": "on", "payload": {"ui": "new_checkout", "coupon": true}},
+        {"id": "off", "payload": {"ui": "classic_checkout", "coupon": false}}
+      ],
+      "dependencies": [],
+      "rules": [
+        {
+          "id": "internal_testers",
+          "conditions": [
+            {"attribute": "tier", "operator": "eq", "value": "staff"}
+          ],
+          "allocations": [
+            {"variant_id": "on", "weight": 10000}
+          ]
+        },
+        {
+          "id": "gold_users_half",
+          "conditions": [
+            {"attribute": "tier", "operator": "eq", "value": "gold"},
+            {"attribute": "age", "operator": "gte", "value": 18}
+          ],
+          "allocations": [
+            {"variant_id": "on", "weight": 5000},
+            {"variant_id": "off", "weight": 5000}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "coupon_popup",
+      "enabled": true,
+      "default_variant": "popup_off",
+      "variants": [
+        {"id": "popup_on", "payload": {"popup": true}},
+        {"id": "popup_off", "payload": {"popup": false}}
+      ],
+      "dependencies": [
+        {"switch": "new_checkout", "variant": "on"}
+      ],
+      "rules": [
+        {
+          "id": "everyone",
+          "conditions": [],
+          "allocations": [
+            {"variant_id": "popup_on", "weight": 2000},
+            {"variant_id": "popup_off", "weight": 8000}
+          ]
+        }
+      ]
+    }
+  ]
+}
