@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
+from app.event_fold import fold_events, fold_streams
+
 # 哈希桶总数：摘要映射到 [0, BUCKETS) 即 0~9999，合法权重总和必须等于该值。
 BUCKETS = 10_000
 
@@ -712,11 +714,22 @@ class ConversionEvent(BaseModel):
     value: float = Field(ge=0)
 
 
+def attribution_event_content(event: ExposureEvent | ConversionEvent) -> tuple:
+    """归因事件的规范化内容身份：首元素为类型，跨类型同 ID 必冲突。
+
+    timestamp 交给共享折叠层做 UTC 等价规范化（不同偏移写法视为同内容）。
+    """
+    if isinstance(event, ExposureEvent):
+        return ("exposure", event.user_id, event.timestamp, event.variant_id)
+    return ("conversion", event.user_id, event.timestamp, event.value)
+
+
 class ExperimentAttributeRequest(BaseModel):
     """POST /experiments/attribute 请求：开关 + 归因窗口 + 洗脱时长 + 乱序事件。
 
-    曝光与转化事件可乱序提交，全局按 event_id 去重：同一 event_id 的内容
-    （类型、user_id、timestamp 及变体/value）必须完全一致，否则 422。
+    曝光与转化事件可乱序提交，全局按 event_id 折叠（app.event_fold）：
+    同一 event_id 的规范化内容（类型、user_id、UTC 时刻及变体/value）
+    一致时只保留首次，跨类型或字段冲突 → 422。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -731,20 +744,11 @@ class ExperimentAttributeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_event_id_conflicts(self) -> "ExperimentAttributeRequest":
-        # event_id -> 归一化内容元组；首元素为事件类型，曝光与转化同 ID 必冲突。
-        seen: dict[str, tuple] = {}
-        for event in self.exposures:
-            content = ("exposure", event.user_id, event.timestamp, event.variant_id)
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
-        for event in self.conversions:
-            content = ("conversion", event.user_id, event.timestamp, event.value)
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
+        # 共享折叠：曝光在前、转化在后；跨类型同 ID 或字段冲突在此即 422。
+        fold_events(
+            fold_streams(self.exposures, self.conversions),
+            attribution_event_content,
+        )
         return self
 
 
@@ -1226,13 +1230,34 @@ class NodeDecisionEvent(BaseModel):
     reason: str | None = None
 
 
+def node_decision_event_content(event: NodeDecisionEvent) -> tuple:
+    """节点决策事件的规范化内容身份。
+
+    timestamp 按 UTC 等价时刻、context 按规范化 JSON（键序不敏感）
+    比较，二者均由共享折叠层（app.event_fold）规范化。
+    """
+    return (
+        event.node_id,
+        event.timestamp,
+        event.digest,
+        event.switch_id,
+        event.user_id,
+        event.context,
+        event.variant_id,
+        event.served_default,
+        event.reason,
+    )
+
+
 class ReconcileRequest(BaseModel):
     """POST /sdk/reconcile 请求：配置快照史 + 宽限 + 时钟偏差 + 节点事件。
 
     - 快照按 activated_at 排序后定义各摘要的允许区间：新版激活至下一版激活，
       旧版合法上报延续到“下一版激活 + grace_seconds”；
     - 事件时间按 clock_skew_seconds 扩为 ±偏差闭区间参与时间分类；
-    - 事件全局按 event_id 去重：同 ID 内容完全一致只计一次，内容冲突 → 422；
+    - 事件全局按 event_id 折叠（app.event_fold）：规范化内容一致的精确
+      重投只计一次，字段冲突（含 UTC 等价时刻/context 键序之外的差异）→
+      422；
     - activated_at 不允许重复（同一时刻两版激活会让允许区间无定义）。
       快照摘要重复（同配置再次激活）与事件引用快照中未知开关在业务层拒绝（422）。
     """
@@ -1252,24 +1277,8 @@ class ReconcileRequest(BaseModel):
                 raise ValueError("配置快照的 activated_at 不允许重复")
             activated.add(snapshot.activated_at)
 
-        # event_id -> 归一化内容；时间已归一到 UTC，context 按规范化 JSON 判等。
-        seen: dict[str, tuple] = {}
-        for event in self.events:
-            content = (
-                event.node_id,
-                event.timestamp,
-                event.digest,
-                event.switch_id,
-                event.user_id,
-                _canonical_json(event.context),
-                event.variant_id,
-                event.served_default,
-                event.reason,
-            )
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
+        # 共享折叠：同 ID 规范化内容（UTC 时刻、context 键序不敏感）冲突即 422。
+        fold_events(self.events, node_decision_event_content)
         return self
 
 
@@ -1575,11 +1584,31 @@ class RolloutAuditEvent(BaseModel):
         return self
 
 
+def rollout_audit_event_content(event: RolloutAuditEvent) -> tuple:
+    """铺开执行审计事件的规范化内容身份（含 sequence 与类型相关全部字段）。
+
+    类型无关字段在事件形状校验中保证缺省，这里仍逐字段比较：跨类型
+    （如 wave_started vs node_completed 同 ID）或任一字段不同即冲突。
+    """
+    return (
+        event.sequence,
+        event.type,
+        event.wave,
+        event.node_id,
+        event.metric_id,
+        event.batch,
+        event.failures,
+        event.total,
+    )
+
+
 class RolloutAuditRequest(BaseModel):
     """POST /sdk/rollout-audit 请求：status=planned 原计划 + 护栏声明 + 事件流。
 
-    事件按 sequence 折叠重放（请求内可乱序提交）；同一 event_id 同内容
-    去重，内容冲突 → 422；sequence 不允许重复 → 422。
+    事件先经共享折叠（app.event_fold）按 event_id 去重（请求内可乱序
+    提交）：同一 event_id 规范化内容一致的精确重投只保留首次，跨类型或
+    任一字段（含 sequence）冲突 → 422；折叠后再按 sequence 升序重放，
+    去重后 sequence 不允许重复 → 422（唯一性在折叠之后检查）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1651,36 +1680,15 @@ class RolloutAuditRequest(BaseModel):
                         f"'{event.metric_id}'"
                     )
 
-        # event_id 折叠键：同 ID 内容必须完全一致（含 sequence 与类型相关字段）。
-        seen: dict[str, tuple] = {}
-        for event in self.events:
-            content = (
-                event.sequence,
-                event.type,
-                event.wave,
-                event.node_id,
-                event.metric_id,
-                event.batch,
-                event.failures,
-                event.total,
-            )
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
+        # 共享折叠：同 event_id 规范化内容必须一致（含 sequence、类型
+        # 与类型相关字段）；精确重投保留首次，冲突在此即 422。
+        unique_events = fold_events(self.events, rollout_audit_event_content)
 
-        # 去重后 sequence 必须唯一。
-        sequences = {event.sequence for event_id, event in self._deduped().items()}
-        if len(sequences) != len(seen):
+        # 铺开审计特有：折叠后 sequence 必须唯一（在折叠之后检查）。
+        sequences = [event.sequence for event in unique_events]
+        if len(set(sequences)) != len(sequences):
             raise ValueError("事件 sequence 不允许重复")
         return self
-
-    def _deduped(self) -> dict[str, RolloutAuditEvent]:
-        """按 event_id 去重（保留首个）；调用时内容冲突已由校验拒绝。"""
-        unique: dict[str, RolloutAuditEvent] = {}
-        for event in self.events:
-            unique.setdefault(event.event_id, event)
-        return unique
 
 
 class RolloutAuditStatus(str, enum.Enum):

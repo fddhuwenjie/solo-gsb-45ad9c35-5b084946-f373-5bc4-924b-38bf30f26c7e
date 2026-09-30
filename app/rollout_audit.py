@@ -4,8 +4,10 @@
 
 - 请求携带 status=planned 的原计划（/sdk/rollout-plan 的输出）、护栏指标
   声明（参数同 /guardrails/evaluate）与 wave_started / node_completed /
-  metric_batch 事件；事件可乱序提交，按 sequence 升序折叠重放，同 event_id
-  同内容去重（内容冲突、sequence 重复在模型层即 422）；
+  metric_batch 事件；事件可乱序提交，先经共享折叠层（app.event_fold）按
+  event_id 判定身份——UTC 等价时刻与同值字段视为同一内容，精确重投只
+  保留首次，跨类型或字段冲突（含 sequence 不同）在模型层即 422；折叠后
+  检查 sequence 唯一性，再按 sequence 升序重放；
 - 序贯约束（遇到首个违规即停止，返回违规事件与事前状态，违规事件不落状态）：
     - wave_started 必须严格按波次顺序：上一波 promote 前启动下一波即
       wave_skipped（hold 时越波），重复启动已启动波为 wave_already_started；
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import math
 
+from app.event_fold import fold_events
 from app.guardrails import evaluate_metric
 from app.models import (
     GuardrailBatch,
@@ -46,6 +49,7 @@ from app.models import (
     RolloutViolationKind,
     RolloutWaveAudit,
     RolloutWaveStatus,
+    rollout_audit_event_content,
 )
 
 
@@ -212,9 +216,11 @@ class _AuditEngine:
         )
 
     def replay(self) -> RolloutAuditResponse:
-        # 按 event_id 去重后按 sequence 升序折叠。
+        # 共享折叠按 event_id 去重（精确重投保留首次，冲突已 422），
+        # 随后按 sequence 升序重放；sequence 唯一性已在折叠后校验。
         events = sorted(
-            self.request._deduped().values(), key=lambda event: event.sequence
+            fold_events(self.request.events, rollout_audit_event_content),
+            key=lambda event: event.sequence,
         )
         for event in events:
             response = self._apply(event)

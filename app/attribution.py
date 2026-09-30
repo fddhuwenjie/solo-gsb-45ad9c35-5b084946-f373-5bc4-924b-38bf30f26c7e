@@ -2,8 +2,10 @@
 
 语义概述：
 
-- 事件全局按 event_id 去重（同一 event_id 内容冲突在模型校验阶段即 422），
-  随后按 (user_id, timestamp, event_id) 排序处理；
+- 事件先经共享折叠层（app.event_fold）按 event_id 判定身份：UTC 等价
+  时刻与同值 context 视为同一内容，精确重投只保留首次，跨类型或字段
+  冲突在模型校验阶段即 422；折叠后再按 (user_id, timestamp, event_id)
+  排序处理；
 - 转化归给窗口内不晚于它的最近曝光：曝光时刻 ≤ 转化时刻且
   转化时刻 − 曝光时刻 ≤ window_seconds（闭区间）；同一时刻多个曝光时
   取 event_id 最大者；
@@ -21,6 +23,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from datetime import datetime, timedelta
 
+from app.event_fold import fold_events
 from app.models import (
     AttributionStatus,
     ConversionAttribution,
@@ -29,24 +32,22 @@ from app.models import (
     ExperimentAttributeResponse,
     ExposureEvent,
     VariantAttribution,
+    attribution_event_content,
 )
-
-
-def _dedupe(
-    exposures: list[ExposureEvent],
-    conversions: list[ConversionEvent],
-) -> tuple[list[ExposureEvent], list[ConversionEvent]]:
-    """全局按 event_id 去重（同 ID 内容一致，冲突已在模型层拒绝）。"""
-    unique_exposures = list({event.event_id: event for event in exposures}.values())
-    unique_conversions = list({event.event_id: event for event in conversions}.values())
-    return unique_exposures, unique_conversions
 
 
 def attribute_experiment(
     request: ExperimentAttributeRequest,
 ) -> ExperimentAttributeResponse:
     """对整批乱序曝光/转化事件做确定性归因并汇总。"""
-    exposures, conversions = _dedupe(request.exposures, request.conversions)
+    # 共享折叠：同 event_id 精确重投保留首次；跨类型同 ID 的冲突已由
+    # 模型校验（曝光在前、转化在后的同一次折叠）拒绝，这里各自折叠即可。
+    exposures: list[ExposureEvent] = fold_events(
+        request.exposures, attribution_event_content
+    )
+    conversions: list[ConversionEvent] = fold_events(
+        request.conversions, attribution_event_content
+    )
 
     # 曝光按用户分组，组内按 (时刻, event_id) 升序，供“最近曝光”二分查找。
     exposures_by_user: dict[str, list[ExposureEvent]] = {}

@@ -13,7 +13,10 @@
   所报摘要不在任何快照中 → unknown_digest（不参与后续重算）；
 - 可识别摘要的事件复用评估器在对应快照配置上重算
   variant_id / served_default / reason，任一不符即 decision_mismatch=true；
-- 事件全局按 event_id 去重（同 ID 内容一致只计一次，冲突在模型层即 422）；
+- 事件先经共享折叠层（app.event_fold）按 event_id 判定身份：UTC 等价
+  时刻与键序不同但值相同的 context 视为同一内容，精确重投只计一次，
+  字段冲突在模型层即 422；折叠后再按 (node_id, timestamp, event_id)
+  排序；
 - 结果按 (node_id, timestamp, event_id) 升序，并按节点汇总各分类计数，
   输出顺序与事件提交顺序无关。
 """
@@ -23,6 +26,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from app.artifacts import config_digest
+from app.event_fold import fold_events
 from app.evaluator import Evaluator
 from app.models import (
     ConfigSnapshot,
@@ -33,6 +37,7 @@ from app.models import (
     ReconcileResponse,
     ReconcileResult,
     RecomputedDecision,
+    node_decision_event_content,
 )
 
 
@@ -58,11 +63,6 @@ def _classify(
     return ReconcileClassification.AMBIGUOUS_TIME
 
 
-def _dedupe(events: list[NodeDecisionEvent]) -> list[NodeDecisionEvent]:
-    """全局按 event_id 去重（同 ID 内容一致，冲突已在模型层拒绝）。"""
-    return list({event.event_id: event for event in events}.values())
-
-
 def reconcile(request: ReconcileRequest) -> ReconcileResponse:
     """对整批节点决策事件做时间分类与决策重算比对，并按节点汇总。"""
     snapshots = sorted(request.snapshots, key=lambda snap: snap.activated_at)
@@ -85,7 +85,10 @@ def reconcile(request: ReconcileRequest) -> ReconcileResponse:
         windows[digest] = (snapshot.activated_at, end)
         configs[digest] = snapshot
 
-    events = _dedupe(request.events)
+    # 共享折叠：精确重投保留首次，内容冲突已在模型层 422。
+    events: list[NodeDecisionEvent] = fold_events(
+        request.events, node_decision_event_content
+    )
 
     evaluators = {
         digest: Evaluator(snapshot.config) for digest, snapshot in configs.items()
