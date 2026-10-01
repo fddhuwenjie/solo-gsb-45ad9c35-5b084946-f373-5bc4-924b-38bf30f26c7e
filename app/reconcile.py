@@ -13,7 +13,9 @@
   所报摘要不在任何快照中 → unknown_digest（不参与后续重算）；
 - 可识别摘要的事件复用评估器在对应快照配置上重算
   variant_id / served_default / reason，任一不符即 decision_mismatch=true；
-- 事件全局按 event_id 去重（同 ID 内容一致只计一次，冲突在模型层即 422）；
+- 事件身份判定与折叠复用 app.event_fold：同 event_id 的规范化内容（UTC
+  时刻、规范化 JSON 的 context 及其余字段）一致只保留首次，冲突在入口
+  转 422；
 - 结果按 (node_id, timestamp, event_id) 升序，并按节点汇总各分类计数，
   输出顺序与事件提交顺序无关。
 """
@@ -24,6 +26,7 @@ from datetime import datetime, timedelta
 
 from app.artifacts import config_digest
 from app.evaluator import Evaluator
+from app.event_fold import canonical_json_key, fold_events, utc_instant
 from app.models import (
     ConfigSnapshot,
     NodeDecisionEvent,
@@ -58,9 +61,19 @@ def _classify(
     return ReconcileClassification.AMBIGUOUS_TIME
 
 
-def _dedupe(events: list[NodeDecisionEvent]) -> list[NodeDecisionEvent]:
-    """全局按 event_id 去重（同 ID 内容一致，冲突已在模型层拒绝）。"""
-    return list({event.event_id: event for event in events}.values())
+def _event_content(event: NodeDecisionEvent) -> tuple:
+    """事件内容键：时刻归一到 UTC，context 按规范化 JSON（键序无关）判等。"""
+    return (
+        event.node_id,
+        utc_instant(event.timestamp),
+        event.digest,
+        event.switch_id,
+        event.user_id,
+        canonical_json_key(event.context),
+        event.variant_id,
+        event.served_default,
+        event.reason,
+    )
 
 
 def reconcile(request: ReconcileRequest) -> ReconcileResponse:
@@ -85,7 +98,10 @@ def reconcile(request: ReconcileRequest) -> ReconcileResponse:
         windows[digest] = (snapshot.activated_at, end)
         configs[digest] = snapshot
 
-    events = _dedupe(request.events)
+    # 共享折叠：同 event_id 规范化内容一致只保留首次，冲突抛 EventIdentityConflict。
+    events = fold_events(
+        request.events, lambda event: event.event_id, _event_content
+    )
 
     evaluators = {
         digest: Evaluator(snapshot.config) for digest, snapshot in configs.items()

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.attribution import attribute_experiment
+from app.event_fold import EventIdentityConflict
 from app.models import (
     AttributionStatus,
     ConversionEvent,
@@ -188,27 +189,43 @@ def test_same_instant_different_offset_dedupes_not_conflicts():
 
 
 def test_conflicting_exposure_variant_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(exposures=[exposure("e1", variant="A"), exposure("e1", variant="B")])
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        attribute_experiment(
+            make_request(
+                exposures=[exposure("e1", variant="A"), exposure("e1", variant="B")]
+            )
+        )
 
 
 def test_conflicting_exposure_user_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(exposures=[exposure("e1", user="u1"), exposure("e1", user="u2")])
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        attribute_experiment(
+            make_request(
+                exposures=[exposure("e1", user="u1"), exposure("e1", user="u2")]
+            )
+        )
 
 
 def test_conflicting_conversion_value_or_time_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(
-            conversions=[conversion("c1", value=1.0), conversion("c1", value=2.0)]
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        attribute_experiment(
+            make_request(
+                conversions=[conversion("c1", value=1.0), conversion("c1", value=2.0)]
+            )
         )
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(conversions=[conversion("c1", at=0), conversion("c1", at=5)])
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        attribute_experiment(
+            make_request(
+                conversions=[conversion("c1", at=0), conversion("c1", at=5)]
+            )
+        )
 
 
 def test_same_id_across_exposure_and_conversion_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(exposures=[exposure("x")], conversions=[conversion("x")])
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        attribute_experiment(
+            make_request(exposures=[exposure("x")], conversions=[conversion("x")])
+        )
 
 
 # ---------------------------------------------------------------------------

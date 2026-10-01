@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.artifacts import config_digest
+from app.event_fold import EventIdentityConflict
 from app.models import (
     Allocation,
     Condition,
@@ -456,37 +457,45 @@ def test_same_instant_different_offset_dedupes():
 
 
 def test_conflicting_event_content_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(
-            three_snapshots(),
-            [
-                event("e1", at=ts(100), digest=D1, variant="on"),
-                event("e1", at=ts(100), digest=D1, variant="off"),
-            ],
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        reconcile(
+            make_request(
+                three_snapshots(),
+                [
+                    event("e1", at=ts(100), digest=D1, variant="on"),
+                    event("e1", at=ts(100), digest=D1, variant="off"),
+                ],
+            )
         )
 
 
 def test_conflicting_event_node_or_time_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(
-            three_snapshots(),
-            [
-                event("e1", node="node-a", at=ts(100), digest=D1),
-                event("e1", node="node-b", at=ts(100), digest=D1),
-            ],
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        reconcile(
+            make_request(
+                three_snapshots(),
+                [
+                    event("e1", node="node-a", at=ts(100), digest=D1),
+                    event("e1", node="node-b", at=ts(100), digest=D1),
+                ],
+            )
         )
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(
-            three_snapshots(),
-            [event("e1", at=ts(100), digest=D1), event("e1", at=ts(101), digest=D1)],
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        reconcile(
+            make_request(
+                three_snapshots(),
+                [event("e1", at=ts(100), digest=D1), event("e1", at=ts(101), digest=D1)],
+            )
         )
 
 
 def test_conflicting_event_digest_rejected():
-    with pytest.raises(ValueError, match="内容冲突"):
-        make_request(
-            three_snapshots(),
-            [event("e1", at=ts(100), digest=D1), event("e1", at=ts(100), digest=D2)],
+    with pytest.raises(EventIdentityConflict, match="内容冲突"):
+        reconcile(
+            make_request(
+                three_snapshots(),
+                [event("e1", at=ts(100), digest=D1), event("e1", at=ts(100), digest=D2)],
+            )
         )
 
 

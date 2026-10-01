@@ -4,8 +4,10 @@
 
 - 请求携带 status=planned 的原计划（/sdk/rollout-plan 的输出）、护栏指标
   声明（参数同 /guardrails/evaluate）与 wave_started / node_completed /
-  metric_batch 事件；事件可乱序提交，按 sequence 升序折叠重放，同 event_id
-  同内容去重（内容冲突、sequence 重复在模型层即 422）；
+  metric_batch 事件；事件可乱序提交。事件身份判定与折叠复用
+  app.event_fold：同 event_id 规范化内容一致只保留首次（含 sequence、
+  类型与类型相关字段），内容冲突抛 EventIdentityConflict；折叠之后再检查
+  sequence 唯一性（DuplicateSequenceError），随后按 sequence 升序重放；
 - 序贯约束（遇到首个违规即停止，返回违规事件与事前状态，违规事件不落状态）：
     - wave_started 必须严格按波次顺序：上一波 promote 前启动下一波即
       wave_skipped（hold 时越波），重复启动已启动波为 wave_already_started；
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import math
 
+from app.event_fold import fold_events
 from app.guardrails import evaluate_metric
 from app.models import (
     GuardrailBatch,
@@ -47,6 +50,37 @@ from app.models import (
     RolloutWaveAudit,
     RolloutWaveStatus,
 )
+
+
+class DuplicateSequenceError(Exception):
+    """折叠后的事件流存在重复 sequence（无法确定重放顺序，入口返回 422）。"""
+
+
+def _event_content(event: RolloutAuditEvent) -> tuple:
+    """事件内容键：含 sequence、类型与全部类型相关字段，任一字段不同即冲突。"""
+    return (
+        event.sequence,
+        event.type,
+        event.wave,
+        event.node_id,
+        event.metric_id,
+        event.batch,
+        event.failures,
+        event.total,
+    )
+
+
+def fold_audit_events(
+    events: list[RolloutAuditEvent],
+) -> list[RolloutAuditEvent]:
+    """共享 event_id 折叠后再检查 sequence 唯一性，返回去重事件（保持首次顺序）。"""
+    folded = fold_events(events, lambda event: event.event_id, _event_content)
+    sequences: set[int] = set()
+    for event in folded:
+        if event.sequence in sequences:
+            raise DuplicateSequenceError("事件 sequence 不允许重复")
+        sequences.add(event.sequence)
+    return folded
 
 
 def _initial_metric(spec: RolloutGuardrailSpec) -> GuardrailMetricResult:
@@ -212,9 +246,11 @@ class _AuditEngine:
         )
 
     def replay(self) -> RolloutAuditResponse:
-        # 按 event_id 去重后按 sequence 升序折叠。
+        # 共享 event_id 折叠（冲突抛 EventIdentityConflict），折叠后 sequence
+        # 唯一性已在 fold_audit_events 检查，这里按 sequence 升序重放。
         events = sorted(
-            self.request._deduped().values(), key=lambda event: event.sequence
+            fold_audit_events(self.request.events),
+            key=lambda event: event.sequence,
         )
         for event in events:
             response = self._apply(event)

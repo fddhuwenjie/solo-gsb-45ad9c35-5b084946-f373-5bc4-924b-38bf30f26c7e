@@ -715,8 +715,9 @@ class ConversionEvent(BaseModel):
 class ExperimentAttributeRequest(BaseModel):
     """POST /experiments/attribute 请求：开关 + 归因窗口 + 洗脱时长 + 乱序事件。
 
-    曝光与转化事件可乱序提交，全局按 event_id 去重：同一 event_id 的内容
-    （类型、user_id、timestamp 及变体/value）必须完全一致，否则 422。
+    曝光与转化事件可乱序提交；event_id 身份判定与折叠统一由
+    app.event_fold 在业务层完成：同一 event_id 规范化内容（类型、user_id、
+    UTC 时刻及变体/value）一致只保留首次，跨类型或字段冲突 → 422。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -728,24 +729,6 @@ class ExperimentAttributeRequest(BaseModel):
     washout_seconds: int = Field(ge=0)
     exposures: list[ExposureEvent] = Field(default_factory=list)
     conversions: list[ConversionEvent] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _check_event_id_conflicts(self) -> "ExperimentAttributeRequest":
-        # event_id -> 归一化内容元组；首元素为事件类型，曝光与转化同 ID 必冲突。
-        seen: dict[str, tuple] = {}
-        for event in self.exposures:
-            content = ("exposure", event.user_id, event.timestamp, event.variant_id)
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
-        for event in self.conversions:
-            content = ("conversion", event.user_id, event.timestamp, event.value)
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
-        return self
 
 
 class AttributionStatus(str, enum.Enum):
@@ -1232,7 +1215,9 @@ class ReconcileRequest(BaseModel):
     - 快照按 activated_at 排序后定义各摘要的允许区间：新版激活至下一版激活，
       旧版合法上报延续到“下一版激活 + grace_seconds”；
     - 事件时间按 clock_skew_seconds 扩为 ±偏差闭区间参与时间分类；
-    - 事件全局按 event_id 去重：同 ID 内容完全一致只计一次，内容冲突 → 422；
+    - event_id 身份判定与折叠统一由 app.event_fold 在业务层完成：同 ID
+      规范化内容（UTC 时刻、规范化 context 及各字段）一致只保留首次，
+      冲突 → 422；
     - activated_at 不允许重复（同一时刻两版激活会让允许区间无定义）。
       快照摘要重复（同配置再次激活）与事件引用快照中未知开关在业务层拒绝（422）。
     """
@@ -1251,25 +1236,6 @@ class ReconcileRequest(BaseModel):
             if snapshot.activated_at in activated:
                 raise ValueError("配置快照的 activated_at 不允许重复")
             activated.add(snapshot.activated_at)
-
-        # event_id -> 归一化内容；时间已归一到 UTC，context 按规范化 JSON 判等。
-        seen: dict[str, tuple] = {}
-        for event in self.events:
-            content = (
-                event.node_id,
-                event.timestamp,
-                event.digest,
-                event.switch_id,
-                event.user_id,
-                _canonical_json(event.context),
-                event.variant_id,
-                event.served_default,
-                event.reason,
-            )
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
         return self
 
 
@@ -1578,8 +1544,9 @@ class RolloutAuditEvent(BaseModel):
 class RolloutAuditRequest(BaseModel):
     """POST /sdk/rollout-audit 请求：status=planned 原计划 + 护栏声明 + 事件流。
 
-    事件按 sequence 折叠重放（请求内可乱序提交）；同一 event_id 同内容
-    去重，内容冲突 → 422；sequence 不允许重复 → 422。
+    事件可乱序提交；event_id 身份判定、折叠与折叠后的 sequence 唯一性
+    检查统一由 app.event_fold 在业务层（app.rollout_audit）完成：同 ID
+    规范化内容一致只保留首次，内容冲突或折叠后 sequence 重复 → 422。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1631,7 +1598,6 @@ class RolloutAuditRequest(BaseModel):
 
         # 事件引用完整性（业务引用错误属于请求不合法，422）。
         wave_count = len(self.plan.waves)
-        up_to_date = set(self.plan.up_to_date_nodes)
         for event in self.events:
             if event.wave is not None and not 1 <= event.wave <= wave_count:
                 raise ValueError(
@@ -1650,37 +1616,7 @@ class RolloutAuditRequest(BaseModel):
                         f"事件 '{event.event_id}' 引用了未声明的护栏指标: "
                         f"'{event.metric_id}'"
                     )
-
-        # event_id 折叠键：同 ID 内容必须完全一致（含 sequence 与类型相关字段）。
-        seen: dict[str, tuple] = {}
-        for event in self.events:
-            content = (
-                event.sequence,
-                event.type,
-                event.wave,
-                event.node_id,
-                event.metric_id,
-                event.batch,
-                event.failures,
-                event.total,
-            )
-            previous = seen.get(event.event_id)
-            if previous is not None and previous != content:
-                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
-            seen[event.event_id] = content
-
-        # 去重后 sequence 必须唯一。
-        sequences = {event.sequence for event_id, event in self._deduped().items()}
-        if len(sequences) != len(seen):
-            raise ValueError("事件 sequence 不允许重复")
         return self
-
-    def _deduped(self) -> dict[str, RolloutAuditEvent]:
-        """按 event_id 去重（保留首个）；调用时内容冲突已由校验拒绝。"""
-        unique: dict[str, RolloutAuditEvent] = {}
-        for event in self.events:
-            unique.setdefault(event.event_id, event)
-        return unique
 
 
 class RolloutAuditStatus(str, enum.Enum):

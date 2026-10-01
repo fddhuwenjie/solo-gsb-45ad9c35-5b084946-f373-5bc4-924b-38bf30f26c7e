@@ -2,8 +2,11 @@
 
 语义概述：
 
-- 事件全局按 event_id 去重（同一 event_id 内容冲突在模型校验阶段即 422），
-  随后按 (user_id, timestamp, event_id) 排序处理；
+- 曝光与转化事件先经共享的事件身份判定与折叠（app.event_fold）：
+  同 event_id 的规范化内容（类型、用户、UTC 时刻、变体/value）一致只
+  保留首次；曝光与转化共用同一 event_id 属于跨类型冲突，任一字段不同
+  也属于冲突，均在入口转 422。随后按 (user_id, timestamp, event_id)
+  排序处理；
 - 转化归给窗口内不晚于它的最近曝光：曝光时刻 ≤ 转化时刻且
   转化时刻 − 曝光时刻 ≤ window_seconds（闭区间）；同一时刻多个曝光时
   取 event_id 最大者；
@@ -20,7 +23,9 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from datetime import datetime, timedelta
+from typing import Union
 
+from app.event_fold import fold_events, utc_instant
 from app.models import (
     AttributionStatus,
     ConversionAttribution,
@@ -31,14 +36,57 @@ from app.models import (
     VariantAttribution,
 )
 
+# 折叠记录里承载的业务事件：曝光或转化。
+_AttributionEvent = Union[ExposureEvent, ConversionEvent]
 
-def _dedupe(
+
+def _fold_inputs(
     exposures: list[ExposureEvent],
     conversions: list[ConversionEvent],
 ) -> tuple[list[ExposureEvent], list[ConversionEvent]]:
-    """全局按 event_id 去重（同 ID 内容一致，冲突已在模型层拒绝）。"""
-    unique_exposures = list({event.event_id: event for event in exposures}.values())
-    unique_conversions = list({event.event_id: event for event in conversions}.values())
+    """跨两类事件做共享折叠：内容键首元素为类型鉴别符，同 ID 跨类型必冲突。
+
+    记录为 (event_id, 内容键, 类别, 原事件)；fold_events 只依赖前两项，
+    类别（0 曝光 / 1 转化）用于折叠后拆回两个列表，且保持各 ID 首次出现顺序。
+    """
+    records: list[tuple[str, tuple, int, _AttributionEvent]] = [
+        (
+            event.event_id,
+            (
+                "exposure",
+                event.user_id,
+                utc_instant(event.timestamp),
+                event.variant_id,
+            ),
+            0,
+            event,
+        )
+        for event in exposures
+    ]
+    records.extend(
+        (
+            event.event_id,
+            (
+                "conversion",
+                event.user_id,
+                utc_instant(event.timestamp),
+                event.value,
+            ),
+            1,
+            event,
+        )
+        for event in conversions
+    )
+
+    folded = fold_events(records, lambda record: record[0], lambda record: record[1])
+    unique_exposures: list[ExposureEvent] = []
+    unique_conversions: list[ConversionEvent] = []
+    for _, _, kind, event in folded:
+        if kind == 0:
+            # 类别 0 的记录在构造时只可能承载曝光事件。
+            unique_exposures.append(event)  # type: ignore[arg-type]
+        else:
+            unique_conversions.append(event)  # type: ignore[arg-type]
     return unique_exposures, unique_conversions
 
 
@@ -46,7 +94,9 @@ def attribute_experiment(
     request: ExperimentAttributeRequest,
 ) -> ExperimentAttributeResponse:
     """对整批乱序曝光/转化事件做确定性归因并汇总。"""
-    exposures, conversions = _dedupe(request.exposures, request.conversions)
+    exposures, conversions = _fold_inputs(
+        request.exposures, request.conversions
+    )
 
     # 曝光按用户分组，组内按 (时刻, event_id) 升序，供“最近曝光”二分查找。
     exposures_by_user: dict[str, list[ExposureEvent]] = {}

@@ -8,6 +8,7 @@ from app.approvals import evaluate_approvals
 from app.artifacts import load_signing_keys, sign_config, verify_artifact
 from app.attribution import attribute_experiment
 from app.evaluator import ConfigError, Evaluator
+from app.event_fold import EventIdentityConflict
 from app.explanations import MinimizeRequestError, minimize_context
 from app.guardrails import evaluate_guardrails
 from app.models import (
@@ -47,7 +48,7 @@ from app.reconcile import ReconcileRequestError, reconcile
 from app.release_windows import resolve_release_windows
 from app.retirement import RetirementRequestError, build_retirement_plan
 from app.rollout import build_rollout_plan
-from app.rollout_audit import audit_rollout
+from app.rollout_audit import DuplicateSequenceError, audit_rollout
 from app.validation import validate_config
 
 app = FastAPI(
@@ -177,8 +178,12 @@ def attribute_experiment_endpoint(
     request: ExperimentAttributeRequest,
 ) -> ExperimentAttributeResponse:
     """实验归因：事件去重排序后，把转化归给窗口内最近曝光，洗脱区间内记 contaminated。"""
-    # event_id 内容冲突、负 value、负窗口/洗脱时长等在模型校验阶段即 422。
-    return attribute_experiment(request)
+    # event_id 身份判定与折叠在共享层（app.event_fold）完成：UTC 等价时刻、
+    # 跨类型/字段冲突在此转 422；负 value、负窗口/洗脱时长等在模型校验阶段即 422。
+    try:
+        return attribute_experiment(request)
+    except EventIdentityConflict as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 @app.post("/artifacts/sign", response_model=SignResponse)
@@ -295,6 +300,9 @@ def reconcile_sdk_logs(request: ReconcileRequest) -> ReconcileResponse:
     except ReconcileRequestError as exc:
         # 快照摘要重复、事件引用快照中不存在的开关。
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    except EventIdentityConflict as exc:
+        # 同一 event_id 规范化内容不一致（跨节点/时刻/摘要/入参/结果）。
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 @app.post("/sdk/rollout-plan", response_model=RolloutPlanResponse)
@@ -318,6 +326,10 @@ def sdk_rollout_audit(request: RolloutAuditRequest) -> RolloutAuditResponse:
     独立累计。首个违规即停止：返回违规事件与事前状态；合法日志返回各波
     完成节点、护栏路径与 running/completed/rollback_required 总状态。
     """
-    # event_id 内容冲突、sequence 重复、事件引用未知波次/节点/指标、
-    # 非 planned 计划、护栏参数非法等在模型校验阶段即 422。
-    return audit_rollout(request)
+    # event_id 身份判定与折叠、折叠后的 sequence 唯一性在共享层
+    # （app.event_fold + app.rollout_audit）完成，冲突在此转 422；事件引用
+    # 未知波次/节点/指标、非 planned 计划、护栏参数非法等在模型校验阶段即 422。
+    try:
+        return audit_rollout(request)
+    except (EventIdentityConflict, DuplicateSequenceError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None

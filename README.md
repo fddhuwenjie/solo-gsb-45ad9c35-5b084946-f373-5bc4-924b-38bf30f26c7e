@@ -18,9 +18,12 @@
 - **多人审批**：按 `sequence` 折叠 approve/reject/revoke 事件流，
   否决角色一票即 `blocked`，否则把有效赞成票按角色匹配分配到审批组，
   判定所有组能否同时达到 `min_approvals`，输出 `approved / pending / blocked`；
-- **实验归因**：对乱序的曝光/转化事件按 `event_id` 全局去重并排序，
+- **实验归因**：对乱序的曝光/转化事件先用统一事件折叠组件按 `event_id`
+  规范化去重并排序（UTC 等价时刻视为同一内容，跨类型/字段冲突 422），
   把每笔转化归给归因窗口内不晚于它的最近曝光（变体切换后的半开洗脱区间内
   记为 `contaminated`），输出各变体的去重曝光用户数、转化数与 value 合计；
+  同一折叠组件也用于 SDK 决策日志核对与铺开执行审计（折叠后再按各自排序/
+  `sequence` 重放）；
 - **发布窗口求解**：给定多份含 IANA 时区的地区维护日历（本地按 weekday
   定义、可跨午夜的周期窗口 + UTC 黑窗），计算查询范围内所有日历**共同**
   可发布的 UTC 半开区间，正确处理春季跳时（不存在时刻顺延）与秋季重复
@@ -512,6 +515,40 @@ curl -s http://localhost:8000/approvals/evaluate \
   -d '{"artifact_digest": "b7f3", "roles": ["dev", "sec"], "people": [{"id": "alice", "roles": ["dev"]}, {"id": "carol", "roles": ["sec"]}], "groups": [{"id": "dev_group", "allowed_roles": ["dev"], "min_approvals": 1}], "veto_roles": ["sec"], "events": [{"sequence": 1, "person": "alice", "action": "approve", "artifact_digest": "b7f3"}]}'
 ```
 
+### 统一事件身份判定与折叠（实验归因 / SDK 决策日志核对 / 铺开执行审计）
+
+`/experiments/attribute`、`/sdk/reconcile` 与 `/sdk/rollout-audit` 三个入口
+都接收可乱序提交的事件流，它们共用同一套**事件身份判定与折叠**组件
+（`app/event_fold.py`），不再各自维护去重逻辑。折叠发生在各业务排序或
+`sequence` 重放**之前**，语义三处完全一致：
+
+1. **按 `event_id` 判定身份**：同一 `event_id` 的多条事件，规范化后的内容
+   相等时视为同一事件的**精确重投**，折叠只保留**首次**出现的一条
+   （后续重复条静默丢弃，不报错）；
+2. **规范化内容等价规则**：
+
+   - **UTC 等价时刻**：时间字段先归一到 UTC——naive 时间视为 UTC，带偏移
+     时间换算到 UTC；因此 `2026-01-01T00:00:00Z` 与
+     `2026-01-01T08:00:00+08:00` 表示同一时刻，视为同一内容；
+   - **JSON 键序无关**：JSON 字段（`/sdk/reconcile` 的 `context`）按规范化
+     JSON 比较，对象键按字典序归一，`{"a":1,"b":2}` 与 `{"b":2,"a":1}`
+     视为同一内容；
+3. **跨类型或字段冲突 → `422`**：同一 `event_id` 却对应不同事件类型
+   （如曝光与转化共用一个 ID），或任一字段取值不同（用户、时刻、变体/
+   value、节点、摘要、context、sequence、类型相关字段等），统一返回 `422`
+   （`事件 ID 内容冲突: '<event_id>'`）。
+
+折叠之后才进入各业务自己的处理：
+
+| 入口 | 折叠后的处理 |
+| --- | --- |
+| `/experiments/attribute` | 按 `(user_id, timestamp, event_id)` 排序后做归因 |
+| `/sdk/reconcile` | 按 `(node_id, timestamp, event_id)` 排序后分类、重算 |
+| `/sdk/rollout-audit` | **在折叠后**检查 `sequence` 唯一性（同 sequence 的不同事件 → `422`），再按 `sequence` 升序重放 |
+
+三个接口的 HTTP 路径、状态码、响应字段、输出排序、首个违规及违规响应中的
+事前状态均不因共用折叠组件而改变。
+
 ### `POST /experiments/attribute` — 实验归因（曝光 → 转化）
 
 按灰度曝光事件为转化做**确定性归因**：给定一个开关的曝光与转化事件流
@@ -544,8 +581,10 @@ curl -s http://localhost:8000/approvals/evaluate \
 
 处理流程：
 
-1. **全局按 `event_id` 去重**：同一 `event_id` 的事件内容（类型、用户、时刻、
-   变体/value）完全一致时只计一次；内容冲突（含曝光与转化共用同一 ID）→ `422`；
+1. **统一事件折叠**（共享层，语义见
+   [事件身份判定与折叠](#统一事件身份判定与折叠实验归因--sdk-决策日志核对--铺开执行审计)）：
+   跨曝光/转化两类事件按 `event_id` 折叠，同一 `event_id` 规范化内容一致
+   （含 UTC 等价时刻）只保留首次，曝光与转化共用 ID 属跨类型冲突 → `422`；
 2. 按 **(user_id, timestamp, event_id)** 排序；
 3. 每笔转化归给**窗口内不晚于它的最近曝光**，同一时刻有多个曝光时取
    `event_id` 最大者：
@@ -599,12 +638,13 @@ curl -s http://localhost:8000/approvals/evaluate \
 
 | 规则 | 说明 |
 | --- | --- |
-| `event_id` 冲突 | 同一 `event_id` 内容不一致（含曝光与转化共用 ID） |
+| `event_id` 冲突 | 同一 `event_id` 规范化内容不一致：跨类型（曝光与转化共用 ID），或用户、UTC 时刻、变体/value 任一字段不同 |
 | 非负约束 | 转化 `value ≥ 0`、`window_seconds ≥ 0`、`washout_seconds ≥ 0` |
 | 必填非空 | `switch_id`、`event_id`、`user_id`、`variant_id` 不允许空串 |
 | 额外字段 | 请求与各事件对象均拒绝未声明字段 |
 
-完全一致的重复事件（含同一时刻的不同时区写法）会被静默去重，不报 `422`。
+完全一致的重复事件（含同一时刻的不同时区写法）会被统一折叠层静默去重，
+不报 `422`。
 
 请求示例：
 
@@ -1038,7 +1078,10 @@ curl -s http://localhost:8000/flags/retirement-plan \
   `variant_id / served_default / reason`，任一不符即
   `decision_mismatch=true`（`unknown_digest` 时 `recomputed` 与
   `decision_mismatch` 均为 `null`）；
-- 事件全局按 `event_id` 去重：同 ID 内容完全一致只计一次，内容冲突 → `422`。
+- 事件身份判定与折叠复用[统一事件折叠组件](#统一事件身份判定与折叠实验归因--sdk-决策日志核对--铺开执行审计)：
+  同 `event_id` 规范化内容一致（UTC 等价时刻、`context` 键序不同但值相同）
+  只保留首次，内容冲突 → `422`；折叠后再按 `(node_id, timestamp, event_id)`
+  排序输出。
 
 响应（`200`）：`results` 按 `(node_id, timestamp, event_id)` 升序，
 `nodes` 按 `node_id` 升序给出每节点的事件数与各分类计数
@@ -1082,11 +1125,12 @@ curl -s http://localhost:8000/flags/retirement-plan \
 | 快照配置 | 每份配置复用 `/validate` 校验，未通过 → `422`（错误路径带 `snapshots[i]` 前缀） |
 | 时长 | `grace_seconds ≥ 0`、`clock_skew_seconds ≥ 0` |
 | 事件引用 | 可识别摘要的事件必须引用该快照配置中存在的开关（无法重算即拒绝） |
-| `event_id` 冲突 | 同一 `event_id` 内容不一致（含节点、时刻、摘要、入参或结果不同） |
+| `event_id` 冲突 | 同一 `event_id` 规范化内容不一致（UTC 时刻不同、context 值不同或节点、摘要、入参、结果等字段不同） |
 | 必填非空 | `event_id`、`node_id`、`digest`、`switch_id`、`user_id`、`variant_id` 不允许空串 |
 | 额外字段 | 请求、快照与事件对象均拒绝未声明字段 |
 
-完全一致的重复事件（含同一时刻的不同时区写法）会被静默去重，不报 `422`。
+完全一致的重复事件（含同一时刻的不同时区写法、键序不同但值相同的
+context）会被统一折叠层静默去重，不报 `422`。
 
 请求示例：
 
@@ -1271,8 +1315,10 @@ curl -s http://localhost:8000/sdk/rollout-plan \
 
 折叠与序贯护栏：
 
-- 事件先按 `event_id` **去重**（同 ID 内容完全一致只计一次，内容冲突 →
-  `422`），再按 `sequence` 升序重放（`sequence` 重复 → `422`）；
+- 事件先经[统一事件折叠组件](#统一事件身份判定与折叠实验归因--sdk-决策日志核对--铺开执行审计)
+  按 `event_id` **折叠**（同 ID 规范化内容一致只计一次，含 `sequence`、类型
+  或任一字段不同即内容冲突 → `422`），**折叠后再检查 `sequence` 唯一性**
+  （同 sequence 的不同事件 → `422`），最后按 `sequence` 升序重放；
 - `wave_started` 必须严格按波次顺序：**`promote` 后方可启动下一波**——
   前一波未启动（越波）或护栏仍为 `hold` 时启动下一波均为 `wave_skipped`；
   重复启动已启动波为 `wave_already_started`；
@@ -1372,7 +1418,7 @@ curl -s http://localhost:8000/sdk/rollout-plan \
 | 护栏 | 1～8 个，`id` 唯一；比率与 α/β 约束同 `/guardrails/evaluate` |
 | 事件引用 | `wave` 必须在计划范围内；`node_id` 必须属于该波（已达目标节点不在任何波）；`metric_id` 必须已声明 |
 | 事件形状 | 三类事件只允许携带各自的必填字段；`failures ≤ total` |
-| 折叠 | 同一 `event_id` 内容冲突（含 `sequence`、类型或任一字段不同）；去重后 `sequence` 重复 |
+| 折叠 | 同一 `event_id` 规范化内容冲突（含 `sequence`、类型或任一字段不同）→ `422`；精确重投折叠成一条；去重（折叠）后 `sequence` 仍重复 → `422` |
 | 额外字段 | 请求与事件对象均拒绝未声明字段 |
 
 请求示例：
@@ -1474,26 +1520,31 @@ pytest
   event_id 内容冲突、护栏 ID 重复/参数非法、波次号不连续、节点跨波重复、
   计划计数不一致、事件形状错配（failures>total/多余字段）422；
 - API：健康检查、404、坏配置/环/未知依赖返回 422、同用户结果稳定、不同盐值产生分流、
-  发布窗口求解往返与非 UTC 拒绝。
+  发布窗口求解往返与非 UTC 拒绝；
+- 跨入口事件折叠契约：三入口共享 event_fold 组件——乱序提交结果一致、UTC
+  等价时刻（`Z` / `+08:00` / naive）与 context JSON 键序不同视为同一精确
+  重投只保留首次、归因跨类型 ID 与各入口字段冲突重投 422、铺开审计在折叠
+  后检查同 sequence 的不同事件 422（精确重投不占用 sequence）。
 
 ## 5. 项目结构
 
 ```
 app/
   models.py          # Pydantic 模型（开关/变体/依赖/规则/制品/护栏/审批/归因/发布窗口/最小上下文/权重重排/下线方案/分波铺开/日志核对/请求响应）
+  event_fold.py      # 共享事件身份判定与折叠：event_id 规范化内容（UTC 等价时刻、规范化 JSON）比较、精确重投保留首次、冲突报错
   validation.py      # 依赖图、引用、权重、环检测（迭代 DFS 三色标记，显式栈）
   evaluator.py       # 迭代依赖评估（显式帧栈 + 轨迹段树）、条件求值、SHA-256 分桶、权重选变体
   explanations.py    # 最小充分上下文：依赖闭包属性收集（迭代）、保留集合（属性数/字典序）枚举、域值与缺失态重评
   guardrails.py      # Wald SPRT：逐批累计 LLR、阈值判定、冻结、总决策汇总
   artifacts.py       # 规范化 JSON、SHA-256 摘要、HMAC-SHA256 签发/验签、密钥加载
   approvals.py       # 多人审批：事件折叠、否决判定、最大流分组配额、字典序最小分配
-  attribution.py     # 实验归因：event_id 去重、最近曝光匹配、归因窗口、变体切换半开洗脱
+  attribution.py     # 实验归因：共享 event_fold 折叠后最近曝光匹配、归因窗口、变体切换半开洗脱
   release_windows.py # 发布窗口：周期窗口逐日展开（跨午夜/DST gap 顺延/fold 早晚）、合并、扣黑窗、交集裁剪
   rebalance.py       # 权重重排：枚举目标顺序求全稳定桶最大布局（字典序破平局）、迁移矩阵与同向相邻区间合并
   retirement.py      # 开关下线方案：blocker 收集、终态依赖改写、候选分层删除（依赖方先于被依赖方）
   rollout.py         # 制品分波铺开：子集可行性剪枝枚举、最少波次 DP（下界短路）、字典序最小重建
-  rollout_audit.py   # 铺开执行审计：事件按 sequence 折叠重放、逐波独立复用 Wald SPRT、违规即停
-  reconcile.py       # 决策日志核对：快照摘要允许区间、±偏差时间分类、评估器重算比对、节点计数
+  rollout_audit.py   # 铺开执行审计：共享 event_fold 折叠 + 折叠后 sequence 唯一性、按 sequence 重放、逐波独立复用 Wald SPRT、违规即停
+  reconcile.py       # 决策日志核对：共享 event_fold 折叠、快照摘要允许区间、±偏差时间分类、评估器重算比对、节点计数
   main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/rollout-plan /sdk/rollout-audit /sdk/reconcile /health
 tests/               # pytest 套件
 examples/config.json
